@@ -1,0 +1,189 @@
+---
+title: "Rates2026"
+output: html_document
+date: "2026-10-16"
+---
+
+# LAura - check on FAB, determine what rate was being used prior to the IR meter
+```{r}
+library(janitor)
+library(tidyverse)
+
+# sewer rates
+sewer_rates <- tribble(
+  ~eff_date,                 ~sewer_rate,
+  as.Date("2000-01-01"),     3.629,   # flat through mid-2025
+  as.Date("2025-08-01"),     3.738,   # FY25/26 (3% increase)
+  as.Date("2026-08-01"),     3.803    # FY26/27 (1.75% increase) - estimate, verify
+)
+
+# water rates
+water_rates <- tribble(
+  ~eff_date_w,              ~inc_1, ~inc_2, ~inc_3, ~inc_4,  ~unin_1, ~unin_2, ~unin_3, ~unin_4,
+  as.Date("2023-02-13"),  2.07,   3.82,   8.39,   12.93,   2.28,    4.58,    10.91,   18.10,
+  as.Date("2023-07-03"),  2.18,   4.02,   8.50,   13.10,   2.40,    4.82,    11.05,   18.34,
+  as.Date("2024-07-01"),  2.31,   4.24,   8.74,   13.31,   2.54,    5.09,    11.36,   18.63,  # unincorporated estimated. not currently in use.
+  as.Date("2025-08-04"),  2.32,   4.25,   8.56,   12.87,   2.76,    5.06,    10.18,   15.31,
+  as.Date("2026-07-01"),  2.33,   4.26,   8.57,   12.89,   2.77,    5.07,    10.20,   15.34   # proposed change, not validated
+)
+
+# Bring in data
+dat <- read.csv("Rates2026.csv") %>%
+  # clean column names
+  clean_names() %>%
+  # clean dates
+  mutate(meter_reading_date = as.Date(meter_reading_date, format = "%m/%d/%Y")) %>%
+  # select required fields
+  select(customer_name, meter_reading_date, meter_reading_service, meter_reading_total_consumption_actual) %>%
+  # pivot wider
+  pivot_wider(id_cols = c("customer_name", "meter_reading_date"), values_from = meter_reading_total_consumption_actual, names_from = meter_reading_service)
+
+
+dat2 <- dat %>%
+  # meters were read up to 5 days apart during billing cycle. this consolicates into a single row per cycle.
+  rename(date = meter_reading_date, 
+         name = customer_name) %>%
+  mutate(date = as.Date(date)) %>%
+  arrange(name, date) %>%
+  group_by(name) %>%
+  mutate(grp = cumsum(is.na(date - lag(date)) | date - lag(date) >= 5)) %>%
+  group_by(name, grp) %>%
+  summarise(
+    date = min(date),
+    IR   = first(na.omit(IR)),
+    WA   = first(na.omit(WA)),
+    .groups = "drop"
+  ) %>%
+  select(-grp) %>%
+  mutate(displayname = case_when(
+    str_detect(name,"FLOW") ~ "FAB",
+    str_detect(name,"BRECK") ~ "BRE",
+    str_detect(name,"KOWA") ~ "CAC",
+    str_detect(name,"GRAH") ~ "AGG"
+  )) %>%
+  # find only since meter has started being read
+  mutate(newrate = ifelse(
+    displayname == "FAB" & date >= as.Date("2025-12-22")
+    | displayname == "BRE" & date >= as.Date("2025-06-24")
+    | displayname == "AGG" & date >= as.Date("2025-12-02")
+    | displayname == "CAC" & date >= as.Date("2025-07-01"),1,0)
+  ) %>%
+  arrange(displayname, date) %>%
+  select(displayname, date, WA, IR, newrate) %>%
+
+  
+  # determine which properties are on sewer
+  mutate(sewer = case_when(
+    displayname %in% c("FAB","AGG","CAC") ~ 1,
+    displayname == "BRE" ~ 0,
+    TRUE ~ NA_real_),
+  incorporated = case_when(
+    displayname %in% c("FAB","AGG","CAC") ~ 1,
+    displayname == "BRE" ~ 0,
+    TRUE ~ NA_real_)
+  )%>%
+  
+  # calculate the pre-separation value
+  mutate(
+    # add zero for consolidated values for WAC
+    IR = replace_na(IR, 0),
+    WA = replace_na(WA,0),
+    combined = WA+IR,
+    
+    # calculate the consolidated WAP
+    month = month(date),
+    wap_mon = ifelse(month %in% c(12,1,2), 1,0),
+    wap_year = case_when(
+      month %in% c(1:11) ~ year(date),
+      month %in% c(12) ~ year(date) + 1
+    )) %>%
+  group_by(displayname, wap_year, wap_mon) %>%
+  mutate(WAP = mean(combined),
+         WAP = ifelse(wap_mon == 0, NA, WAP)) %>%
+  ungroup() %>%
+  group_by(displayname, wap_year) %>%
+  fill(WAP, .direction = "down") %>%
+  ungroup() %>%
+  # calculate the consolidated rate
+  left_join(water_rates, by = join_by(closest(date >= eff_date_w))) %>%
+  left_join(sewer_rates, by = join_by(closest(date >= eff_date))) 
+
+dat3 <- dat2 %>%
+  mutate(
+    # CCFs falling within each tier
+    ccf_t1 = pmin(combined, 7),
+    ccf_t2 = pmax(pmin(combined, 15) - 7, 0),
+    ccf_t3 = pmax(pmin(combined, 30) - 15, 0),
+    ccf_t4 = pmax(combined - 30, 0),
+
+    # Charges
+    cost_incorporated   = ccf_t1 * inc_1 + ccf_t2 * inc_2 +
+                          ccf_t3 * inc_3 + ccf_t4 * inc_4,
+
+    cost_unincorporated = ccf_t1 * unin_1 + ccf_t2 * unin_2 +
+                          ccf_t3 * unin_3 + ccf_t4 * unin_4
+  )  %>%
+  mutate(
+    sewer_ccf  = if_else(wap_mon == 1,
+                         combined,
+                         pmin(combined, WAP)),
+    sewer_cost = sewer_ccf * sewer_rate
+  ) %>%
+  select(-eff_date) %>%
+  
+  mutate(wa_cost = case_when(
+    incorporated == 1 & sewer == 1 ~ cost_incorporated + sewer_cost,
+    incorporated == 1 & sewer == 0 ~ cost_incorporated + 0,
+    incorporated == 0 & sewer == 1 ~ cost_unincorporated + sewer_cost,
+    incorporated == 0 & sewer == 0 ~ cost_unincorporated + 0),
+    wa_cost = round(wa_cost,2))
+
+
+newmeteronly <- dat2 %>%
+  filter(newrate == 1) %>%
+  
+  # secondary WAP
+  group_by(displayname, wap_year, wap_mon) %>%
+  mutate(WAP2 = mean(WA),
+         WAP2 = ifelse(wap_mon == 0, NA, WAP2)) %>%
+  ungroup() %>%
+  group_by(displayname, wap_year) %>%
+  fill(WAP2, .direction = "down") %>%
+  ungroup() %>%
+  mutate(useWAP = ifelse(!is.na(WAP2), WAP2, WAP)) %>%
+  
+  mutate(
+    # CCFs falling within each tier
+    ccf_t1 = pmin(WA, 7),
+    ccf_t2 = pmax(pmin(WA, 15) - 7, 0),
+    ccf_t3 = pmax(pmin(WA, 30) - 15, 0),
+    ccf_t4 = pmax(WA - 30, 0),
+
+    # Charges
+    cost_incorporated   = ccf_t1 * inc_1 + ccf_t2 * inc_2 +
+                          ccf_t3 * inc_3 + ccf_t4 * inc_4,
+
+    cost_unincorporated = ccf_t1 * unin_1 + ccf_t2 * unin_2 +
+                          ccf_t3 * unin_3 + ccf_t4 * unin_4
+  )  %>%
+  mutate(
+    sewer_ccf  = if_else(wap_mon == 1,
+                         WA,
+                         pmin(WA, useWAP)),
+    sewer_cost = sewer_ccf * sewer_rate
+  ) %>%
+  select(-eff_date) %>%
+  
+  mutate(combined_cost = case_when(
+    incorporated == 1 & sewer == 1 ~ cost_incorporated + sewer_cost,
+    incorporated == 1 & sewer == 0 ~ cost_incorporated + 0,
+    incorporated == 0 & sewer == 1 ~ cost_unincorporated + sewer_cost,
+    incorporated == 0 & sewer == 0 ~ cost_unincorporated + 0),
+    combined_cost = round(combined_cost,2))
+
+dat4 <- dat3 %>%
+  full_join(newmeteronly %>% select(displayname, date, combined_cost), by = c("displayname","date")) %>%
+  mutate(savings = wa_cost - combined_cost)
+  
+```
+
