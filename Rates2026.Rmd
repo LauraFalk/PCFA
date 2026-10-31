@@ -4,21 +4,21 @@ output: html_document
 date: "2026-10-16"
 ---
 
-# LAura - check on FAB, determine what rate was being used prior to the IR meter
+# 
 ```{r}
 library(janitor)
 library(tidyverse)
 
 # sewer rates
 sewer_rates <- tribble(
-  ~eff_date,                 ~sewer_rate,
+  ~eff_date_s,                 ~sewer_rate,
   as.Date("2000-01-01"),     3.629,   # flat through mid-2025
   as.Date("2025-08-01"),     3.738,   # FY25/26 (3% increase)
   as.Date("2026-08-01"),     3.803    # FY26/27 (1.75% increase) - estimate, verify
 )
 
 # water rates
-water_rates <- tribble(
+res_rates <- tribble(
   ~eff_date_w,              ~inc_1, ~inc_2, ~inc_3, ~inc_4,  ~unin_1, ~unin_2, ~unin_3, ~unin_4,
   as.Date("2023-02-13"),  2.07,   3.82,   8.39,   12.93,   2.28,    4.58,    10.91,   18.10,
   as.Date("2023-07-03"),  2.18,   4.02,   8.50,   13.10,   2.40,    4.82,    11.05,   18.34,
@@ -26,6 +26,26 @@ water_rates <- tribble(
   as.Date("2025-08-04"),  2.32,   4.25,   8.56,   12.87,   2.76,    5.06,    10.18,   15.31,
   as.Date("2026-07-01"),  2.33,   4.26,   8.57,   12.89,   2.77,    5.07,    10.20,   15.34   # proposed change, not validated
 )
+
+com_rates <- tribble(
+  ~eff_date_c,              ~regime,  ~base_i, ~t1_i, ~t2_i, ~base_u, ~t1_u, ~t2_u,
+  as.Date("2023-02-13"),  "legacy", 3.36,    1.08,  0.29,  3.69,    1.19,  0.32,
+  as.Date("2023-07-03"),  "legacy", 3.49,    1.14,  0.31,  3.84,    1.25,  0.34,
+  as.Date("2024-03-01"),  "new",    3.43,    1.14,  0.31,  3.77,    1.25,  0.34,
+  as.Date("2025-02-03"),  "new",    3.59,    1.19,    0.31,    4.25,      1.42,    0.37,    # surcharges not found, used 8/25 values
+  as.Date("2025-08-04"),  "new",    3.57,    1.19,  0.31,  4.25,    1.42,  0.37
+)
+
+cg_rates <- tribble(
+  ~eff_date_g,            ~cg_i,  ~cg_u,
+  as.Date("2023-02-13"),  2.56,   2.81,   # unincorporated estimated
+  as.Date("2023-07-03"),  2.67,   2.93,
+  as.Date("2024-07-01"),  2.79,   3.07,   # unincorporated estimated
+  as.Date("2025-08-04"),  2.78,   3.31
+)
+# commercial helpers
+round_wac <- TRUE   # 2023 city memo rounds the WAC to the nearest CCF; set FALSE if bills don't match
+rnd <- function(x) if (round_wac) floor(x + 0.5) else x
 
 # Bring in data
 dat <- read.csv("Rates2026.csv") %>%
@@ -74,28 +94,49 @@ dat2 <- dat %>%
   
   # determine which properties are on sewer
   mutate(sewer = case_when(
-    displayname %in% c("FAB","AGG","CAC") ~ 1,
-    displayname == "BRE" ~ 0,
+    displayname %in% c("AGG","CAC") ~ 1,
+    displayname %in% c("FAB","BRE") ~ 0,
     TRUE ~ NA_real_),
   incorporated = case_when(
     displayname %in% c("FAB","AGG","CAC") ~ 1,
-    displayname == "BRE" ~ 0,
-    TRUE ~ NA_real_)
-  )%>%
+    displayname %in% c("BRE") ~ 0,
+    TRUE ~ NA_real_),
+  rate_type = case_when(
+    displayname %in% c("FAB") ~ "com",
+    displayname %in% c("BRE","AGG","CAC") ~ "res",
+    TRUE ~ NA_character_),
+  
+  ) %>%
   
   # calculate the pre-separation value
   mutate(
     # add zero for consolidated values for WAC
     IR = replace_na(IR, 0),
     WA = replace_na(WA,0),
-    combined = WA+IR,
-    
+    combined = WA+IR) %>%
+    # fix weird extra billing thing
+  filter(combined != 0) %>%
+  
+  group_by(displayname) %>%
+  arrange(date, .by_group = TRUE) %>%
+  mutate(
+    # whole months between consecutive reads (at least 1; a 60-day gap counts as 2)
+    step = if_else(row_number() == 1, 0,
+                   pmax(1, round(as.numeric(date - lag(date)) / 30.4))),
+    # first reading is placed with the calendar rule, then months count up from there
+    anchor        = floor_date(first(date) - days(15), "month"),
+    service_month = anchor %m+% months(cumsum(step))
+  ) %>%
+  ungroup() %>%
+  select(-step, -anchor) %>%
+
     # calculate the consolidated WAP
-    month = month(date),
-    wap_mon = ifelse(month %in% c(12,1,2), 1,0),
+  mutate(
+    month    = month(service_month),
+    wap_mon  = ifelse(month %in% c(12, 1, 2), 1, 0),
     wap_year = case_when(
-      month %in% c(1:11) ~ year(date),
-      month %in% c(12) ~ year(date) + 1
+      month %in% 1:11 ~ year(service_month),
+      month == 12     ~ year(service_month) + 1
     )) %>%
   group_by(displayname, wap_year, wap_mon) %>%
   mutate(WAP = mean(combined),
@@ -105,44 +146,71 @@ dat2 <- dat %>%
   fill(WAP, .direction = "down") %>%
   ungroup() %>%
   # calculate the consolidated rate
-  left_join(water_rates, by = join_by(closest(date >= eff_date_w))) %>%
-  left_join(sewer_rates, by = join_by(closest(date >= eff_date))) 
+  left_join(res_rates, by = join_by(closest(date >= eff_date_w))) %>%
+  left_join(sewer_rates, by = join_by(closest(date >= eff_date_s))) %>%
+  left_join(com_rates, by = join_by(closest(date >= eff_date_c))) %>%
+  left_join(cg_rates, by = join_by(closest(date >= eff_date_g))) 
+  
+
+dat2 %>% count(displayname, service_month) %>% filter(n > 1)
 
 dat3 <- dat2 %>%
+  # Legacy (pre-March 2024) commercial WAC: Nov-Apr average, zero months excluded
+  mutate(leg_year = if_else(month >= 11, year(date) + 1, year(date)),
+         leg_in   = month %in% c(11, 12, 1:4) & combined > 0) %>%
+  group_by(displayname, leg_year) %>%
+  mutate(wac_old = if (any(leg_in)) rnd(mean(combined[leg_in])) else 0) %>%
+  ungroup() %>%
+
   mutate(
-    # CCFs falling within each tier
+    # ---- residential tiers ----
     ccf_t1 = pmin(combined, 7),
     ccf_t2 = pmax(pmin(combined, 15) - 7, 0),
     ccf_t3 = pmax(pmin(combined, 30) - 15, 0),
     ccf_t4 = pmax(combined - 30, 0),
 
-    # Charges
     cost_incorporated   = ccf_t1 * inc_1 + ccf_t2 * inc_2 +
                           ccf_t3 * inc_3 + ccf_t4 * inc_4,
-
     cost_unincorporated = ccf_t1 * unin_1 + ccf_t2 * unin_2 +
-                          ccf_t3 * unin_3 + ccf_t4 * unin_4
-  )  %>%
-  mutate(
-    sewer_ccf  = if_else(wap_mon == 1,
-                         combined,
-                         pmin(combined, WAP)),
+                          ccf_t3 * unin_3 + ccf_t4 * unin_4,
+
+    # ---- commercial: base + summer surcharges ----
+    com_base = if_else(incorporated == 1, base_i, base_u),
+    com_t1   = if_else(incorporated == 1, t1_i,   t1_u),
+    com_t2   = if_else(incorporated == 1, t2_i,   t2_u),
+
+    # winter average: Dec-Feb incl. zeros (your WAP) after Mar 2024, Nov-Apr excl. zeros before
+    com_wac    = if_else(regime == "legacy", wac_old, rnd(WAP)),
+    com_summer = if_else(regime == "legacy", month %in% 5:10, month %in% 3:11),
+
+    com_surcharge = case_when(
+      !com_summer                     ~ 0,
+      com_wac == 0 & regime == "legacy" ~ 0,                      # legacy: base rate only
+      com_wac == 0                    ~ com_t1 * combined,        # new: Tier 1 on all use
+      TRUE                            ~ com_t1 * pmax(combined - com_wac, 0) +
+                                        com_t2 * pmax(combined - 1.45 * com_wac, 0)
+    ),
+    cost_commercial = com_base * combined + com_surcharge,
+
+    # ---- sewer  ----
+    sewer_ccf  = if_else(wap_mon == 1, combined, pmin(combined, WAP)),
     sewer_cost = sewer_ccf * sewer_rate
   ) %>%
-  select(-eff_date) %>%
-  
-  mutate(wa_cost = case_when(
-    incorporated == 1 & sewer == 1 ~ cost_incorporated + sewer_cost,
-    incorporated == 1 & sewer == 0 ~ cost_incorporated + 0,
-    incorporated == 0 & sewer == 1 ~ cost_unincorporated + sewer_cost,
-    incorporated == 0 & sewer == 0 ~ cost_unincorporated + 0),
-    wa_cost = round(wa_cost,2))
+
+  mutate(
+    water_cost = case_when(
+      rate_type == "com" ~ cost_commercial,
+      rate_type == "res" & incorporated == 1  ~ cost_incorporated,
+      rate_type == "res" & incorporated == 0  ~ cost_unincorporated
+    ),
+    wa_cost = round(water_cost + if_else(sewer == 1, sewer_cost, 0), 2)
+  )
 
 
 newmeteronly <- dat2 %>%
   filter(newrate == 1) %>%
-  
-  # secondary WAP
+
+  # secondary WAP (potable meter only)
   group_by(displayname, wap_year, wap_mon) %>%
   mutate(WAP2 = mean(WA),
          WAP2 = ifelse(wap_mon == 0, NA, WAP2)) %>%
@@ -151,39 +219,386 @@ newmeteronly <- dat2 %>%
   fill(WAP2, .direction = "down") %>%
   ungroup() %>%
   mutate(useWAP = ifelse(!is.na(WAP2), WAP2, WAP)) %>%
-  
+
   mutate(
-    # CCFs falling within each tier
+    # ---- residential tiers on WA ----
     ccf_t1 = pmin(WA, 7),
     ccf_t2 = pmax(pmin(WA, 15) - 7, 0),
     ccf_t3 = pmax(pmin(WA, 30) - 15, 0),
     ccf_t4 = pmax(WA - 30, 0),
 
-    # Charges
     cost_incorporated   = ccf_t1 * inc_1 + ccf_t2 * inc_2 +
                           ccf_t3 * inc_3 + ccf_t4 * inc_4,
-
     cost_unincorporated = ccf_t1 * unin_1 + ccf_t2 * unin_2 +
-                          ccf_t3 * unin_3 + ccf_t4 * unin_4
-  )  %>%
-  mutate(
-    sewer_ccf  = if_else(wap_mon == 1,
-                         WA,
-                         pmin(WA, useWAP)),
-    sewer_cost = sewer_ccf * sewer_rate
+                          ccf_t3 * unin_3 + ccf_t4 * unin_4,
+
+    # ---- commercial on WA (all new-meter dates are post-March 2024 rules) ----
+    com_base = if_else(incorporated == 1, base_i, base_u),
+    com_t1   = if_else(incorporated == 1, t1_i,   t1_u),
+    com_t2   = if_else(incorporated == 1, t2_i,   t2_u),
+    com_wac  = rnd(useWAP),
+    com_surcharge = case_when(
+      !(month %in% 3:11) ~ 0,
+      com_wac == 0       ~ com_t1 * WA,
+      TRUE               ~ com_t1 * pmax(WA - com_wac, 0) +
+                           com_t2 * pmax(WA - 1.45 * com_wac, 0)
+    ),
+    cost_commercial = com_base * WA + com_surcharge,
+
+    # ---- sewer on WA ----
+    sewer_ccf  = if_else(wap_mon == 1, WA, pmin(WA, useWAP)),
+    sewer_cost = sewer_ccf * sewer_rate,
+
+    # ---- community garden rate on IR ----
+    cost_cg = IR * if_else(incorporated == 1, cg_i, cg_u)
   ) %>%
-  select(-eff_date) %>%
-  
-  mutate(combined_cost = case_when(
-    incorporated == 1 & sewer == 1 ~ cost_incorporated + sewer_cost,
-    incorporated == 1 & sewer == 0 ~ cost_incorporated + 0,
-    incorporated == 0 & sewer == 1 ~ cost_unincorporated + sewer_cost,
-    incorporated == 0 & sewer == 0 ~ cost_unincorporated + 0),
-    combined_cost = round(combined_cost,2))
+
+  mutate(
+    water_cost = case_when(
+      rate_type == "com"                     ~ cost_commercial,
+      rate_type == "res" & incorporated == 1 ~ cost_incorporated,
+      rate_type == "res" & incorporated == 0 ~ cost_unincorporated
+    ),
+    combined_cost = round(water_cost + cost_cg + if_else(sewer == 1, sewer_cost, 0), 2)
+  ) 
+    
 
 dat4 <- dat3 %>%
-  full_join(newmeteronly %>% select(displayname, date, combined_cost), by = c("displayname","date")) %>%
-  mutate(savings = wa_cost - combined_cost)
+  full_join(newmeteronly %>% select(displayname, service_month, combined_cost), by = c("displayname","service_month")) %>%
+  mutate(savings = wa_cost - combined_cost) %>%
+  filter(!is.na(savings)) 
   
+```
+
+```{r}
+library(tidyverse)
+library(scales)
+
+accent <- "#1B7F6B"   # savings
+muted  <- "#A6A6A6"   # months with no savings / extra cost
+ink    <- "#404040"
+
+# monthly savings per farm (only rows where the new meter exists)
+sav <- dat4 %>%
+  filter(!is.na(savings)) %>%
+  mutate(month = floor_date(service_month, "month")) %>%
+  group_by(displayname, month) %>%
+  summarise(savings = sum(savings), .groups = "drop")
+
+plot_farm <- function(farm) {
+  d     <- filter(sav, displayname == farm)
+  total <- sum(d$savings)
+  best  <- slice_max(d, savings, n = 1, with_ties = FALSE)
+
+  ggplot(d, aes(month, savings, fill = savings > 0)) +
+    geom_col(width = 20) +
+    geom_text(aes(label = dollar(savings, accuracy = 1),
+                  vjust = if_else(savings >= 0, -0.4, 1.3)),
+              size = 3.5, color = ink) +
+    # call out the best month directly on the chart
+    annotate("text", x = best$month, y = best$savings * 1.18,
+             label = "Best month", size = 3.3, color = accent, fontface = "bold") +
+    scale_fill_manual(values = c(`TRUE` = accent, `FALSE` = muted), guide = "none") +
+    scale_x_date(date_breaks = "1 month", date_labels = "%b\n%Y") +
+    scale_y_continuous(expand = expansion(mult = c(0.05, 0.2))) +
+    labs(
+      title    = paste0(farm, " saved ", dollar(total, accuracy = 1),
+                        " since adding its own meter"),
+      subtitle = "Monthly savings: separate meter billing vs. combined billing",
+      x = NULL, y = NULL,
+      caption  = "Savings = combined-meter cost minus separate-meter cost"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      panel.grid       = element_blank(),
+      axis.text.y      = element_blank(),
+      axis.ticks       = element_blank(),
+      axis.text.x      = element_text(color = ink),
+      plot.title       = element_text(face = "bold", size = 16, color = ink, hjust = 0),
+      plot.subtitle    = element_text(color = "#7F7F7F", hjust = 0),
+      plot.caption     = element_text(color = "#7F7F7F", hjust = 0),
+      plot.title.position   = "plot",
+      plot.caption.position = "plot",
+      plot.margin      = margin(15, 20, 10, 15)
+    )
+}
+
+# one chart per farm
+farm_plots <- set_names(unique(sav$displayname)) %>% map(plot_farm)
+
+farm_plots$AGG                                  # view one
+
+iwalk(farm_plots, ~ ggsave(paste0("savings_", .y, ".png"), .x,
+                           width = 9, height = 5, dpi = 300, bg = "white"))
+```
+
+```{r}
+library(tidyverse)
+library(scales)
+library(patchwork)
+
+green <- "#4E7D1B"   # savings bars + titles
+tan   <- "#C9C9B5"   # months with extra cost
+ink   <- "#404040"   # main text
+grey  <- "#7F7F7F"   # secondary text
+
+farm_labels <- c(FAB = "Farm A", BRE = "Farm B", AGG = "Farm C", CAC = "Farm D")
+
+sav <- dat4 %>%
+  filter(!is.na(savings)) %>%
+  mutate(month = floor_date(service_month, "month"),
+         farm  = unname(farm_labels[displayname])) %>%
+  group_by(farm, month) %>%
+  summarise(savings = sum(savings), .groups = "drop")
+
+plot_farm <- function(farm_name) {
+  d     <- filter(sav, farm == farm_name)
+  total <- sum(d$savings)
+
+  ggplot(d, aes(month, savings, fill = savings > 0)) +
+    geom_col(width = 20) +
+    geom_text(aes(label = dollar(savings, accuracy = 1),
+                  vjust = if_else(savings >= 0, -0.4, 1.3)),
+              size = 3, color = ink) +
+    scale_fill_manual(values = c(`TRUE` = green, `FALSE` = tan), guide = "none") +
+    scale_x_date(date_breaks = "2 months", date_labels = "%b\n%y") +
+    scale_y_continuous(expand = expansion(mult = c(0.05, 0.2))) +
+    labs(title    = farm_name,
+         subtitle = paste0(if_else(total >= 0, "saved about ", "cost about "),
+                           dollar(abs(total), accuracy = 100)),
+         x = NULL, y = NULL) +
+    theme_minimal(base_size = 11) +
+    theme(
+      panel.grid          = element_blank(),
+      axis.text.y         = element_blank(),
+      axis.ticks          = element_blank(),
+      axis.text.x         = element_text(color = grey),
+      plot.title          = element_text(face = "bold", size = 14, color = green, hjust = 0),
+      plot.subtitle       = element_text(color = grey, size = 10, hjust = 0),
+      plot.title.position = "plot"
+    )
+}
+
+panels <- map(sort(unique(sav$farm)), plot_farm)
+
+grand_total <- sum(sav$savings)
+floor_10k   <- floor(grand_total / 10000) * 10000
+main_title  <- if (floor_10k > 0) {
+  paste0("Separate meters saved more than ", dollar(floor_10k), " across four farms")
+} else {
+  paste0("Separate meters saved about ", dollar(grand_total, accuracy = 1000), " across four farms")
+}
+
+four_up <- wrap_plots(panels, ncol = 2) +
+  plot_annotation(
+    title   = main_title,
+    caption = paste0("Values are rounded: monthly savings to the nearest $1, farm totals to the nearest $100, ",
+                     "and the overall total down to the nearest $10,000.\n",
+                     "Savings = combined-meter cost minus separate-meter cost."),
+    theme = theme(
+      plot.title   = element_text(face = "bold", size = 20, color = ink),
+      plot.caption = element_text(color = grey, hjust = 0),
+      plot.margin  = margin(15, 20, 10, 15)
+    )
+  )
+
+four_up
+ggsave("savings_four_farms.png", four_up, width = 12, height = 8, dpi = 300, bg = "white")
+```
+```{r}
+library(tidyverse)
+library(scales)
+
+green <- "#4E7D1B"
+ink   <- "#404040"
+grey  <- "#7F7F7F"
+
+# rank farms by total savings, then label A (highest) to D (lowest) and describe each one
+farm_key <- dat4 %>%
+  filter(!is.na(savings)) %>%
+  group_by(displayname) %>%
+  summarise(savings      = sum(savings),
+            months       = n_distinct(floor_date(service_month, "month")),
+            rate_type    = first(rate_type),
+            sewer        = first(sewer),
+            incorporated = first(incorporated),
+            .groups = "drop") %>%
+  arrange(desc(savings)) %>%
+  mutate(
+    farm = paste("Farm", LETTERS[row_number()]),
+    desc = paste0(if_else(rate_type == "com", "commercial rates", "residential rates"), ", ",
+                  if_else(sewer == 1, "on sewer", "no sewer"), ", ",
+                  if_else(incorporated == 1, "incorporated", "unincorporated")),
+    farm_label = paste0(farm, ": ", desc),     # for panel titles
+    axis_label = paste0(farm, "\n", desc)      # for the summary chart's axis
+  )
+
+site_totals <- farm_key %>%
+  mutate(axis_label = factor(axis_label, levels = rev(axis_label)),   # Farm A on top
+         label = paste0(dollar(savings, accuracy = 100), "  (", months, " months)"))
+
+grand_total <- sum(site_totals$savings)
+floor_10k   <- floor(grand_total / 10000) * 10000
+main_title  <- if (floor_10k > 0) {
+  paste0("Separate meters saved more than ", dollar(floor_10k), " across four farms")
+} else {
+  paste0("Separate meters saved about ", dollar(grand_total, accuracy = 1000), " across four farms")
+}
+
+summary_plot <- ggplot(site_totals, aes(savings, axis_label)) +
+  geom_col(fill = green, width = 0.6) +
+  geom_text(aes(label = label), hjust = -0.1, size = 4.2, color = ink) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.4))) +
+  labs(title    = main_title,
+       subtitle = "Total savings per farm: separate-meter billing vs. combined billing",
+       x = NULL, y = NULL,
+       caption  = paste0("Farms are lettered by total savings (A = highest). Farm totals rounded to the nearest $100; ",
+                         "overall total rounded down to the nearest $10,000.\n",
+                         "Farms began separate metering at different dates, so periods differ.")) +
+  theme_minimal(base_size = 13) +
+  theme(
+    panel.grid            = element_blank(),
+    axis.text.x           = element_blank(),
+    axis.ticks            = element_blank(),
+    axis.text.y           = element_text(color = ink, size = 12, lineheight = 1.1, hjust = 0),
+    plot.title            = element_text(face = "bold", size = 18, color = ink),
+    plot.subtitle         = element_text(color = grey),
+    plot.caption          = element_text(color = grey, hjust = 0),
+    plot.title.position   = "plot",
+    plot.caption.position = "plot",
+    plot.margin           = margin(15, 20, 10, 15)
+  )
+
+summary_plot
+ggsave("savings_summary.png", summary_plot, width = 11, height = 5, dpi = 300, bg = "white")
+```
+```{r}
+library(tidyverse)
+library(scales)
+
+green <- "#4E7D1B"
+tan   <- "#C9C9B5"
+ink   <- "#404040"
+grey  <- "#7F7F7F"
+
+top <- farm_key %>% slice(1)          # highest total savings
+
+top_monthly <- dat4 %>%
+  filter(displayname == top$displayname, !is.na(savings)) %>%
+  mutate(month = floor_date(service_month, "month")) %>%
+  group_by(month) %>%
+  summarise(savings = sum(savings), .groups = "drop")
+
+total <- sum(top_monthly$savings)
+best  <- slice_max(top_monthly, savings, n = 1, with_ties = FALSE)
+
+top_plot <- ggplot(top_monthly, aes(month, savings, fill = savings > 0)) +
+  geom_col(width = 20) +
+  geom_text(aes(label = dollar(savings, accuracy = 1),
+                vjust = if_else(savings >= 0, -0.4, 1.3)),
+            size = 4, color = ink) +
+  # call out the best month directly on the chart
+  annotate("text", x = best$month, y = best$savings * 1.15,
+           label = "Best month", size = 3.8, color = green, fontface = "bold") +
+  scale_fill_manual(values = c(`TRUE` = green, `FALSE` = tan), guide = "none") +
+  scale_x_date(date_breaks = "1 month", date_labels = "%b\n%Y") +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.2))) +
+  labs(
+    title    = paste0(top$farm, " ", if_else(total >= 0, "saved about ", "cost about "),
+                      dollar(abs(total), accuracy = 100), " with its own meter"),
+    subtitle = paste0(top$desc, "  |  Monthly savings: separate-meter billing vs. combined billing"),
+    x = NULL, y = NULL,
+    caption  = paste0("Monthly savings rounded to the nearest $1; total rounded to the nearest $100.\n",
+                      "Savings = combined-meter cost minus separate-meter cost.")
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    panel.grid            = element_blank(),
+    axis.text.y           = element_blank(),
+    axis.ticks            = element_blank(),
+    axis.text.x           = element_text(color = ink),
+    plot.title            = element_text(face = "bold", size = 18, color = ink),
+    plot.subtitle         = element_text(color = grey),
+    plot.caption          = element_text(color = grey, hjust = 0),
+    plot.title.position   = "plot",
+    plot.caption.position = "plot",
+    plot.margin           = margin(15, 20, 10, 15)
+  )
+
+top_plot
+ggsave("savings_top_farm.png", top_plot, width = 11, height = 5.5, dpi = 300, bg = "white")
+```
+```{r}
+library(tidyverse)
+library(scales)
+
+blue_dark  <- "#1F5F8B"   # IR
+blue_light <- "#8FC1E3"   # WA
+blue_text  <- "#5A9BC8"   # readable version of the light blue for text on white
+ink        <- "#404040"
+grey       <- "#7F7F7F"
+
+n_sites <- n_distinct(dat4$displayname)
+
+use_monthly <- dat4 %>%
+  filter(newrate == 1) %>%                                  # only periods when the separate meters are being read
+  mutate(month = floor_date(service_month, "month")) %>%
+  group_by(month, displayname) %>%
+  summarise(IR = sum(IR), WA = sum(WA), .groups = "drop") %>%
+  group_by(month) %>%
+  filter(n_distinct(displayname) == n_sites) %>%            # only months with all four sites
+  summarise(IR = sum(IR), WA = sum(WA), .groups = "drop") %>%
+  mutate(total = IR + WA)
+
+use_long <- use_monthly %>%
+  pivot_longer(c(IR, WA), names_to = "meter", values_to = "ccf") %>%
+  mutate(meter = factor(meter, levels = c("IR", "WA")))     # IR stacks on top
+
+ir_share <- sum(use_monthly$IR) / sum(use_monthly$total)
+last     <- slice_max(use_monthly, month, n = 1, with_ties = FALSE)
+min_lab  <- 0.05 * max(use_monthly$total)                   # hide labels on tiny segments
+
+use_plot <- ggplot(use_long, aes(month, ccf, fill = meter)) +
+  geom_col(width = 20) +
+  geom_text(aes(label = if_else(ccf >= min_lab, comma(ccf, accuracy = 1), ""),
+                color = meter),
+            position = position_stack(vjust = 0.5), size = 3.8) +
+  # monthly totals above each bar
+  geom_text(data = use_monthly, aes(month, total, label = comma(total, accuracy = 1)),
+            inherit.aes = FALSE, vjust = -0.5, size = 4, fontface = "bold", color = ink) +
+  # direct labels instead of a legend
+  annotate("text", x = last$month + 25, y = last$WA + last$IR / 2,
+           label = "Irrigation (IR)", hjust = 0, fontface = "bold", color = blue_dark) +
+  annotate("text", x = last$month + 25, y = last$WA / 2,
+           label = "Water (WA)", hjust = 0, fontface = "bold", color = blue_text) +
+  scale_fill_manual(values  = c(IR = blue_dark, WA = blue_light), guide = "none") +
+  scale_color_manual(values = c(IR = "white",   WA = ink),        guide = "none") +
+  scale_x_date(date_breaks = "1 month", date_labels = "%b\n%Y",
+               expand = expansion(add = c(15, 85))) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
+  labs(
+    title    = paste0("Irrigation made up about ", percent(ir_share, accuracy = 1),
+                      " of water use across the four farms"),
+    subtitle = "Monthly water use (CCF) by meter, all four farms combined",
+    x = NULL, y = NULL,
+    caption  = paste0("Only months with data from all four farms are shown (", nrow(use_monthly),
+                      " months). CCF rounded to the nearest whole number; 1 CCF = 748 gallons.")
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    panel.grid            = element_blank(),
+    axis.text.y           = element_blank(),
+    axis.ticks            = element_blank(),
+    axis.text.x           = element_text(color = ink),
+    plot.title            = element_text(face = "bold", size = 18, color = ink),
+    plot.subtitle         = element_text(color = grey),
+    plot.caption          = element_text(color = grey, hjust = 0),
+    plot.title.position   = "plot",
+    plot.caption.position = "plot",
+    plot.margin           = margin(15, 20, 10, 15)
+  )
+
+use_plot
+ggsave("use_ir_vs_wa.png", use_plot, width = 11, height = 5.5, dpi = 300, bg = "white")
 ```
 
